@@ -1,13 +1,17 @@
 /**
- * Marriage Pulse Check — Lead Capture Backend
- * Open source, self-hosted. No paid services required.
+ * Marriage Pulse Check — Lead Capture Backend (v2)
  *
- * What this does:
- *  - Accepts POST /api/submit from marriage_pulse_check.html
- *  - Stores each lead (name, email, scores, timestamp) in a local SQLite file
- *  - Lets you view all leads at GET /api/leads (protect this in production!)
- *  - Optionally forwards each new lead to MailerLite so they land straight
- *    in your email list (fill in MAILERLITE_API_KEY + MAILERLITE_GROUP_ID below)
+ * WHY THIS VERSION EXISTS
+ * -----------------------
+ * v1 used better-sqlite3, which must compile C++ code during install.
+ * On Render's newer Node versions there are no prebuilt binaries, so the
+ * build failed. This version has ZERO native dependencies — it installs
+ * instantly on any Node version, on any host.
+ *
+ * It also fixes a quieter problem: Render's free tier has an EPHEMERAL
+ * filesystem. Any local database file is wiped whenever the service
+ * restarts or redeploys. So local storage here is only a short-term
+ * convenience buffer — MailerLite is the durable system of record.
  *
  * Requirements: Node.js 18+
  * Install:  npm install
@@ -16,108 +20,146 @@
 
 const express = require("express");
 const cors = require("cors");
-const Database = require("better-sqlite3");
+const fs = require("fs");
 const path = require("path");
 
 const app = express();
-app.use(cors());              // during setup; tighten to your domain before going live
+app.use(cors());
 app.use(express.json());
 
-// ---------- CONFIG ----------
+// ---------- CONFIG (set these as Environment Variables in Render) ----------
 const PORT = process.env.PORT || 3000;
-const ADMIN_KEY = process.env.ADMIN_KEY || "change-this-secret"; // protects /api/leads
+const ADMIN_KEY = process.env.ADMIN_KEY || "change-this-secret";
 
-// Optional: forward leads straight into your MailerLite list.
-// Leave MAILERLITE_API_KEY blank to skip this step entirely.
+// MailerLite is the durable store. Strongly recommended — without it,
+// leads only survive until the next restart on a free hosting tier.
 const MAILERLITE_API_KEY = process.env.MAILERLITE_API_KEY || "";
 const MAILERLITE_GROUP_ID = process.env.MAILERLITE_GROUP_ID || "";
 
-// ---------- DATABASE ----------
-const db = new Database(path.join(__dirname, "leads.db"));
-db.exec(`
-  CREATE TABLE IF NOT EXISTS leads (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    email TEXT,
-    total INTEGER,
-    tier TEXT,
-    weakest TEXT,
-    scores TEXT,
-    answers TEXT,
-    submitted_at TEXT
-  )
-`);
+// ---------- LOCAL BUFFER (best-effort, not permanent storage) ----------
+const DATA_FILE = path.join(__dirname, "leads.json");
+let leads = [];
+
+try {
+  if (fs.existsSync(DATA_FILE)) {
+    leads = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+  }
+} catch (err) {
+  console.error("Could not read existing leads file, starting fresh:", err.message);
+  leads = [];
+}
+
+function persist() {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(leads, null, 2));
+  } catch (err) {
+    // On read-only or ephemeral filesystems this can fail. That's survivable:
+    // the lead is still in memory and already sent to MailerLite.
+    console.error("Local write failed (expected on some hosts):", err.message);
+  }
+}
 
 // ---------- ROUTES ----------
 
-// Health check
-app.get("/", (req, res) => res.send("Marriage Pulse Check backend is running."));
+app.get("/", (req, res) => {
+  res.send("Marriage Pulse Check backend is running. Leads captured this session: " + leads.length);
+});
 
-// Receive a new submission from the quiz
+// Receive a completed assessment
 app.post("/api/submit", async (req, res) => {
   const { name, email, total, tier, weakest, scores, answers, submittedAt } = req.body || {};
 
-  if (!name || !email) {
-    return res.status(400).json({ ok: false, error: "Missing name or email" });
+  if (!name || !email || !String(email).includes("@")) {
+    return res.status(400).json({ ok: false, error: "Missing or invalid name/email" });
   }
 
-  db.prepare(`
-    INSERT INTO leads (name, email, total, tier, weakest, scores, answers, submitted_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    name, email, total || null, tier || null, weakest || null,
-    JSON.stringify(scores || {}), JSON.stringify(answers || []),
-    submittedAt || new Date().toISOString()
-  );
+  const lead = {
+    id: leads.length + 1,
+    name: String(name).slice(0, 120),
+    email: String(email).slice(0, 200).toLowerCase(),
+    total: total ?? null,
+    tier: tier ?? null,
+    weakest: weakest ?? null,
+    scores: scores ?? {},
+    answers: answers ?? [],
+    submittedAt: submittedAt || new Date().toISOString(),
+  };
 
-  // Optional: push to MailerLite so the lead lands in your list automatically
+  leads.push(lead);
+  persist();
+
+  let mailerliteOk = null;
+
   if (MAILERLITE_API_KEY && MAILERLITE_GROUP_ID) {
     try {
-      await fetch(`https://connect.mailerlite.com/api/subscribers`, {
+      const body = {
+        email: lead.email,
+        fields: {
+          name: lead.name,
+          // Custom fields — create these in MailerLite first (see setup guide).
+          pulse_tier: lead.tier || "",
+          pulse_total: lead.total != null ? String(lead.total) : "",
+          pulse_focus: lead.weakest || "",
+        },
+        groups: [MAILERLITE_GROUP_ID],
+      };
+
+      const r = await fetch("https://connect.mailerlite.com/api/subscribers", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${MAILERLITE_API_KEY}`,
+          Accept: "application/json",
+          Authorization: `Bearer ${MAILERLITE_API_KEY}`,
         },
-        body: JSON.stringify({
-          email,
-          fields: { name },
-          groups: [MAILERLITE_GROUP_ID],
-        }),
+        body: JSON.stringify(body),
       });
+
+      mailerliteOk = r.ok;
+      if (!r.ok) {
+        const text = await r.text();
+        console.error("MailerLite rejected the subscriber:", r.status, text);
+      }
     } catch (err) {
-      console.error("MailerLite sync failed:", err.message);
-      // We don't fail the request just because the email sync failed —
-      // the lead is already safely stored in the local database.
+      mailerliteOk = false;
+      console.error("MailerLite request failed:", err.message);
     }
   }
 
-  res.json({ ok: true });
+  // Always succeed for the user — they should see their results either way.
+  res.json({ ok: true, mailerlite: mailerliteOk });
 });
 
-// View all captured leads (simple protection via a shared key — see README)
+// View leads captured since the last restart
 app.get("/api/leads", (req, res) => {
   if (req.query.key !== ADMIN_KEY) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
-  const rows = db.prepare("SELECT * FROM leads ORDER BY id DESC").all();
-  res.json(rows);
+  res.json(leads.slice().reverse());
 });
 
-// Export all leads as CSV (handy for importing into MailerLite / Excel)
+// Export as CSV
 app.get("/api/leads.csv", (req, res) => {
   if (req.query.key !== ADMIN_KEY) {
     return res.status(401).send("Unauthorized");
   }
-  const rows = db.prepare("SELECT * FROM leads ORDER BY id DESC").all();
+  const esc = (v) => {
+    const s = String(v ?? "");
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
   const header = "id,name,email,total,tier,weakest,submitted_at\n";
-  const body = rows.map(r =>
-    [r.id, r.name, r.email, r.total, r.tier, r.weakest, r.submitted_at].join(",")
-  ).join("\n");
+  const body = leads
+    .slice()
+    .reverse()
+    .map((r) => [r.id, r.name, r.email, r.total, r.tier, r.weakest, r.submittedAt].map(esc).join(","))
+    .join("\n");
   res.setHeader("Content-Type", "text/csv");
+  res.setHeader("Content-Disposition", 'attachment; filename="pulse-check-leads.csv"');
   res.send(header + body);
 });
 
 app.listen(PORT, () => {
   console.log(`Marriage Pulse Check backend running on port ${PORT}`);
+  if (!MAILERLITE_API_KEY) {
+    console.warn("WARNING: MailerLite is not configured. Leads will NOT survive a restart.");
+  }
 });
