@@ -137,6 +137,41 @@ app.get("/api/leads", (req, res) => {
   res.json(leads.slice().reverse());
 });
 
+// Diagnostic: ask MailerLite directly for your groups and their correct numeric IDs.
+// Visit /api/mailerlite-groups?key=YOUR_ADMIN_KEY in a browser to use this.
+app.get("/api/mailerlite-groups", async (req, res) => {
+  if (req.query.key !== ADMIN_KEY) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  if (!MAILERLITE_API_KEY) {
+    return res.status(400).json({ ok: false, error: "MAILERLITE_API_KEY is not set on this server." });
+  }
+
+  try {
+    const r = await fetch("https://connect.mailerlite.com/api/groups", {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${MAILERLITE_API_KEY}`,
+      },
+    });
+    const data = await r.json();
+
+    if (!r.ok) {
+      return res.status(r.status).json({ ok: false, mailerliteStatus: r.status, mailerliteResponse: data });
+    }
+
+    const groups = (data.data || []).map((g) => ({
+      name: g.name,
+      id: g.id,
+      typeof_id: typeof g.id,
+    }));
+
+    res.json({ ok: true, groups });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // Export as CSV
 app.get("/api/leads.csv", (req, res) => {
   if (req.query.key !== ADMIN_KEY) {
